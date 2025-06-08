@@ -23,7 +23,7 @@ const jsonParser = bodyParser.json();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: '*',
+    origin: 'https://bingo-bad44.web.app',
     methods: ['GET', 'POST']
   }
 });
