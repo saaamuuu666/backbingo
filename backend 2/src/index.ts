@@ -121,14 +121,12 @@ export function generarCarton(): ({ numero: number, tachado: boolean } | null)[]
   return carton;
 }
 
-// --- RUTAS HTTP ---
-
-/*app.get('/players/:id', async (req, res) => {
+// Endpoints REST API
+app.get('/players/:id', async (req, res) => {
   console.log(`GET /players/${req.params.id}`);
   try {
-    // Prevención de SQL Injection
-    let query = `SELECT * FROM usuarios WHERE id = $1`;
-    let db_response = await db.query(query, [req.params.id]);
+    let query = `SELECT * FROM usuarios WHERE id='${req.params.id}'`;
+    let db_response = await db.query(query);
     res.json(db_response.rows.length > 0 ? db_response.rows[0] : {error: 'User not found'});
   } catch (err) {
     console.error(err);
@@ -138,18 +136,10 @@ export function generarCarton(): ({ numero: number, tachado: boolean } | null)[]
 
 app.post('/user', jsonParser, async (req, res) => {
   console.log('POST /user', req.body);
-  
-  // Validación de datos de entrada
-  if (!req.body.id || !req.body.nombre_usuario || req.body.dinero === undefined) {
-    return res.status(400).json({ error: 'Datos incompletos' });
-  }
-
   try {
-    // Prevención de SQL Injection
     let query = `INSERT INTO usuarios (id, nombre_usuario, dinero)
-      VALUES ($1, $2, $3)`;
-    let params = [req.body.id, req.body.nombre_usuario, req.body.dinero];
-    let db_response = await db.query(query, params);
+      VALUES ('${req.body.id}', '${req.body.nombre_usuario}', ${req.body.dinero})`;
+    let db_response = await db.query(query);
     res.json(db_response.rowCount == 1 ? 
       {message: 'Registro creado correctamente'} : 
       {error: 'No se pudo crear el registro'});
@@ -158,7 +148,7 @@ app.post('/user', jsonParser, async (req, res) => {
     res.status(500).send('Internal Server Error');
   }
 });
-*/
+
 // --- SOCKET.IO ---
 
 io.on('connection', (socket) => {
