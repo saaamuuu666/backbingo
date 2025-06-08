@@ -122,7 +122,7 @@ export function generarCarton(): ({ numero: number, tachado: boolean } | null)[]
 // --- RUTAS HTTP ---
 
 // Endpoints REST API
-app.get('/players/:id', async (req, res) => {
+/*app.get('/players/:id', async (req, res) => {
   console.log(`GET /players/${req.params.id}`);
   try {
     let query = `SELECT * FROM usuarios WHERE id='${req.params.id}'`;
@@ -148,7 +148,7 @@ app.post('/user', jsonParser, async (req, res) => {
     res.status(500).send('Internal Server Error');
   }
 });
-
+*/
 
 // --- SOCKET.IO ---
 

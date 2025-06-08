@@ -1,4 +1,5 @@
 "use strict";
+//////////
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
     Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
@@ -58,168 +59,104 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.generarCarton = void 0;
+// backend.ts
 var express_1 = __importDefault(require("express"));
-var http_1 = __importDefault(require("http"));
-var socket_io_1 = require("socket.io");
 var cors_1 = __importDefault(require("cors"));
+var socket_io_1 = require("socket.io");
+var http_1 = __importDefault(require("http"));
 var path_1 = __importDefault(require("path"));
 var body_parser_1 = __importDefault(require("body-parser"));
 var db = __importStar(require("./db-connection"));
 var app = express_1.default();
+app.use(cors_1.default());
+app.use(body_parser_1.default.json());
+app.use(express_1.default.static(path_1.default.join(__dirname, 'dist/draw_board')));
+var jsonParser = body_parser_1.default.json();
 var server = http_1.default.createServer(app);
 var io = new socket_io_1.Server(server, {
     cors: {
         origin: '*',
         methods: ['GET', 'POST']
-    },
-    connectionStateRecovery: {
-        maxDisconnectionDuration: 2 * 60 * 1000,
-        skipMiddlewares: true
     }
 });
-var port = process.env.PORT || 3000;
-var jsonParser = body_parser_1.default.json();
-app.use(cors_1.default());
-app.use(express_1.default.static(path_1.default.join(__dirname, 'dist/chat-app')));
-// Estructuras para gestión de salas
-var roomHosts = {};
-var rooms = {};
-io.on('connection', function (socket) {
-    console.log('Nuevo cliente conectado:', socket.id);
-    socket.on('disconnect', function (reason) {
-        console.log('Cliente desconectado:', socket.id, 'Razón:', reason);
-        var username = socket.data.username;
-        var roomCode = socket.data.room_code;
-        if (username && roomCode && rooms[roomCode]) {
-            rooms[roomCode].players.delete(username);
-            console.log("Usuario " + username + " removido de sala " + roomCode);
-            if (rooms[roomCode].players.size === 0) {
-                console.log("Sala " + roomCode + " vac\u00EDa, eliminando...");
-                if (rooms[roomCode].interval) {
-                    clearInterval(rooms[roomCode].interval);
+// --- DATOS GLOBALES ---
+var users = {};
+var gameRooms = {};
+// --- FUNCIONES AUXILIARES ---
+function generarOrdenNumeros() {
+    var _a;
+    var numeros = Array.from({ length: 90 }, function (_, i) { return i + 1; });
+    for (var i = numeros.length - 1; i > 0; i--) {
+        var j = Math.floor(Math.random() * (i + 1));
+        _a = [numeros[j], numeros[i]], numeros[i] = _a[0], numeros[j] = _a[1];
+    }
+    return numeros;
+}
+function generarNumerosAleatorios(cantidad, min, max) {
+    var numeros = new Set();
+    while (numeros.size < cantidad) {
+        var num = Math.floor(Math.random() * (max - min + 1)) + min;
+        numeros.add(num);
+    }
+    return Array.from(numeros);
+}
+function generarCarton() {
+    var filas = 3;
+    var columnas = 9;
+    var carton = Array.from({ length: filas }, function () {
+        return Array(columnas).fill(null);
+    });
+    var columnasConNumeros = [];
+    for (var i = 0; i < columnas; i++) {
+        var min = i === 0 ? 1 : i * 10;
+        var max = i === 8 ? 90 : i * 10 + 9;
+        var cantidad = 1 + Math.floor(Math.random() * 2); // 1 o 2 números
+        columnasConNumeros[i] = generarNumerosAleatorios(cantidad, min, max).sort(function (a, b) { return a - b; });
+    }
+    for (var col = 0; col < columnas; col++) {
+        for (var n = 0; n < columnasConNumeros[col].length; n++) {
+            var intentos = 0;
+            while (intentos < 10) {
+                var fila = Math.floor(Math.random() * filas);
+                if (carton[fila][col] === null && carton[fila].filter(function (c) { return c !== null; }).length < 5) {
+                    carton[fila][col] = {
+                        numero: columnasConNumeros[col][n],
+                        tachado: false
+                    };
+                    break;
                 }
-                delete rooms[roomCode];
-                delete roomHosts[roomCode];
-            }
-            else {
-                io.to(roomCode).emit('user_list', Array.from(rooms[roomCode].players));
+                intentos++;
             }
         }
-    });
-    socket.on('join_room', function (data) {
-        console.log('Solicitud para unirse a sala:', data);
-        var code = data.code, username = data.username;
-        if (!code || !username) {
-            console.error('Datos inválidos para unirse a sala');
-            return;
-        }
-        socket.join(code);
-        socket.data.username = username;
-        socket.data.room_code = code;
-        if (!rooms[code]) {
-            console.log("Creando nueva sala: " + code);
-            rooms[code] = {
-                players: new Set(),
-                gameActive: false,
-                numbers: [],
-                calledNumbers: [],
-                currentNumber: null
-            };
-        }
-        rooms[code].players.add(username);
-        console.log("Usuario " + username + " a\u00F1adido a sala " + code);
-        io.to(code).emit('user_list', Array.from(rooms[code].players));
-        if (!roomHosts[code]) {
-            roomHosts[code] = username;
-            socket.emit('set_host', true);
-            console.log("Host establecido: " + username + " en sala " + code);
-        }
-        // Enviar estado actual si el juego ya está en progreso
-        if (rooms[code].gameActive) {
-            console.log("Enviando estado actual a nuevo jugador en sala " + code);
-            socket.emit('game_started');
-            socket.emit('current_state', {
-                numbers: rooms[code].calledNumbers,
-                current: rooms[code].currentNumber
-            });
-        }
-    });
-    socket.on('start_game', function (roomCode) {
-        var _a;
-        console.log("Solicitud para iniciar juego en sala " + roomCode);
-        if (!roomHosts[roomCode] || !rooms[roomCode]) {
-            console.error('Sala no existe o no tiene host');
-            return;
-        }
-        if (roomHosts[roomCode] === socket.data.username) {
-            console.log("Iniciando juego en sala " + roomCode);
-            rooms[roomCode].gameActive = true;
-            // Generar números aleatorios (1-90)
-            rooms[roomCode].numbers = Array.from({ length: 90 }, function (_, i) { return i + 1; });
-            // Barajar los números
-            for (var i = rooms[roomCode].numbers.length - 1; i > 0; i--) {
-                var j = Math.floor(Math.random() * (i + 1));
-                _a = [rooms[roomCode].numbers[j], rooms[roomCode].numbers[i]], rooms[roomCode].numbers[i] = _a[0], rooms[roomCode].numbers[j] = _a[1];
+    }
+    // Asegurar 5 números por fila
+    for (var f = 0; f < filas; f++) {
+        var fila = carton[f];
+        var _loop_1 = function () {
+            var columnasDisponibles = fila
+                .map(function (c, i) { return (c === null ? i : -1); })
+                .filter(function (i) { return i !== -1; });
+            if (!columnasDisponibles.length)
+                return "break";
+            var col = columnasDisponibles[Math.floor(Math.random() * columnasDisponibles.length)];
+            var min = col === 0 ? 1 : col * 10;
+            var max = col === 8 ? 90 : col * 10 + 9;
+            var nuevoNumero = generarNumerosAleatorios(1, min, max)[0];
+            if (!carton.some(function (row) { var _a; return ((_a = row[col]) === null || _a === void 0 ? void 0 : _a.numero) === nuevoNumero; })) {
+                fila[col] = { numero: nuevoNumero, tachado: false };
             }
-            rooms[roomCode].calledNumbers = [];
-            rooms[roomCode].currentNumber = null;
-            // Enviar primer número inmediatamente
-            if (rooms[roomCode].numbers.length > 0) {
-                var firstNumber = rooms[roomCode].numbers.pop();
-                rooms[roomCode].currentNumber = firstNumber;
-                rooms[roomCode].calledNumbers.push(firstNumber);
-                console.log("Enviando primer n\u00FAmero " + firstNumber + " a sala " + roomCode);
-                io.to(roomCode).emit('next_number', firstNumber);
-            }
-            // Iniciar intervalo para números
-            rooms[roomCode].interval = setInterval(function () {
-                if (rooms[roomCode].numbers.length === 0) {
-                    clearInterval(rooms[roomCode].interval);
-                    console.log("Todos los n\u00FAmeros han sido cantados en sala " + roomCode);
-                    return;
-                }
-                var nextNumber = rooms[roomCode].numbers.pop();
-                rooms[roomCode].currentNumber = nextNumber;
-                rooms[roomCode].calledNumbers.push(nextNumber);
-                console.log("Enviando n\u00FAmero " + nextNumber + " a sala " + roomCode);
-                io.to(roomCode).emit('next_number', nextNumber);
-            }, 6000); // 6 segundos
-            io.to(roomCode).emit('game_started');
+        };
+        while (fila.filter(function (c) { return c !== null; }).length < 5) {
+            var state_1 = _loop_1();
+            if (state_1 === "break")
+                break;
         }
-        else {
-            console.log('Intento de inicio no autorizado:', socket.data.username, 'no es host');
-        }
-    });
-    socket.on('bingo', function (data) {
-        console.log('Bingo recibido:', data);
-        var roomCode = data.roomCode;
-        var username = socket.data.username;
-        if (!rooms[roomCode] || !rooms[roomCode].gameActive) {
-            console.log('Juego no activo o sala no existe');
-            return;
-        }
-        // Verificar bingo
-        var isValid = data.markedNumbers.every(function (num) {
-            return rooms[roomCode].calledNumbers.includes(num);
-        });
-        if (isValid) {
-            // Terminar juego para todos
-            if (rooms[roomCode].interval) {
-                clearInterval(rooms[roomCode].interval);
-            }
-            rooms[roomCode].gameActive = false;
-            console.log("\u00A1Bingo v\u00E1lido! " + username + " ha ganado en sala " + roomCode);
-            io.to(roomCode).emit('game_won', {
-                winner: username,
-                cartonIndex: data.cartonIndex
-            });
-        }
-        else {
-            console.log("Bingo inv\u00E1lido de " + username + " en sala " + roomCode);
-            socket.emit('bingo_invalid', data.cartonIndex);
-        }
-    });
-});
+    }
+    return carton;
+}
+exports.generarCarton = generarCarton;
+// --- RUTAS HTTP ---
 // Endpoints REST API
 app.get('/players/:id', function (req, res) { return __awaiter(void 0, void 0, void 0, function () {
     var query, db_response, err_1;
@@ -271,7 +208,80 @@ app.post('/user', jsonParser, function (req, res) { return __awaiter(void 0, voi
         }
     });
 }); });
-server.listen(port, function () {
-    console.log("Servidor escuchando en http://localhost:" + port);
-    console.log('Modo:', process.env.NODE_ENV || 'development');
+// --- SOCKET.IO ---
+io.on('connection', function (socket) {
+    socket.on('disconnect', function () {
+        var _a;
+        var room = socket.data.room_code;
+        var user = socket.data.username;
+        if (room && user && users[room]) {
+            users[room].delete(user);
+            if (users[room].size === 0) {
+                // limpiar sala y juego
+                delete users[room];
+                if ((_a = gameRooms[room]) === null || _a === void 0 ? void 0 : _a.intervalo) {
+                    clearInterval(gameRooms[room].intervalo);
+                }
+            }
+            else {
+                io.to(room).emit('user_list_' + room, Array.from(users[room]));
+            }
+        }
+    });
+    socket.on('join_room', function (_a) {
+        var info = _a.info;
+        var code = info.code, user_name = info.user_name;
+        socket.join(code);
+        socket.data.username = user_name;
+        socket.data.room_code = code;
+        if (!users[code])
+            users[code] = new Set();
+        users[code].add(user_name);
+        if (!gameRooms[code]) {
+            gameRooms[code] = {
+                numerosCantados: [],
+                numerosDisponibles: generarOrdenNumeros(),
+                numeroActual: null,
+                juegoTerminado: false,
+                ganador: null,
+                intervalo: undefined,
+            };
+            // Lanzar números automáticamente cada 6 segundos
+            gameRooms[code].intervalo = setInterval(function () {
+                var room = gameRooms[code];
+                if (!room)
+                    return;
+                if (room.numerosDisponibles.length === 0) {
+                    if (room.intervalo)
+                        clearInterval(room.intervalo);
+                    room.juegoTerminado = true;
+                    io.to(code).emit('game_ended', { ganador: room.ganador || null });
+                    return;
+                }
+                var numero = room.numerosDisponibles.shift();
+                room.numeroActual = numero;
+                room.numerosCantados.push(numero);
+                io.to(code).emit('numero_actual', {
+                    numeroActual: numero,
+                    numerosCantados: room.numerosCantados
+                });
+            }, 6000);
+        }
+        io.to(code).emit('user_list_' + code, Array.from(users[code]));
+    });
+    socket.on('bingo_cantado', function (_a) {
+        var roomCode = _a.roomCode, jugador = _a.jugador;
+        var room = gameRooms[roomCode];
+        if (!room || room.juegoTerminado)
+            return;
+        room.juegoTerminado = true;
+        room.ganador = jugador;
+        if (room.intervalo)
+            clearInterval(room.intervalo);
+        io.to(roomCode).emit('bingo_ganado', {
+            ganador: jugador
+        });
+    });
 });
+var port = process.env.PORT || 3000;
+server.listen(port, function () { return console.log("Servidor corriendo en el puerto " + port); });
