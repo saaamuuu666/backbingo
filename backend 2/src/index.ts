@@ -1,9 +1,3 @@
-
-
-//////////
-
-
-
 // backend.ts
 
 import express from "express";
@@ -15,7 +9,14 @@ import bodyParser from 'body-parser';
 import * as db from './db-connection';
 
 const app = express();
-app.use(cors());
+
+// Configuración segura de CORS
+app.use(cors({
+  origin: '*', // Reemplazar con tu dominio en producción
+  methods: ['GET', 'POST'],
+  credentials: true
+}));
+
 app.use(bodyParser.json());
 app.use(express.static(path.join(__dirname, 'dist/draw_board')));
 const jsonParser = bodyParser.json();
@@ -36,6 +37,7 @@ interface GameRoomState {
   juegoTerminado: boolean;
   ganador: string | null;
   intervalo?: NodeJS.Timeout;
+  juegoIniciado: boolean;          // Nuevo campo para saber si el juego ha sido iniciado
 }
 
 // --- DATOS GLOBALES ---
@@ -121,12 +123,12 @@ export function generarCarton(): ({ numero: number, tachado: boolean } | null)[]
 
 // --- RUTAS HTTP ---
 
-// Endpoints REST API
 /*app.get('/players/:id', async (req, res) => {
   console.log(`GET /players/${req.params.id}`);
   try {
-    let query = `SELECT * FROM usuarios WHERE id='${req.params.id}'`;
-    let db_response = await db.query(query);
+    // Prevención de SQL Injection
+    let query = `SELECT * FROM usuarios WHERE id = $1`;
+    let db_response = await db.query(query, [req.params.id]);
     res.json(db_response.rows.length > 0 ? db_response.rows[0] : {error: 'User not found'});
   } catch (err) {
     console.error(err);
@@ -136,10 +138,18 @@ export function generarCarton(): ({ numero: number, tachado: boolean } | null)[]
 
 app.post('/user', jsonParser, async (req, res) => {
   console.log('POST /user', req.body);
+  
+  // Validación de datos de entrada
+  if (!req.body.id || !req.body.nombre_usuario || req.body.dinero === undefined) {
+    return res.status(400).json({ error: 'Datos incompletos' });
+  }
+
   try {
+    // Prevención de SQL Injection
     let query = `INSERT INTO usuarios (id, nombre_usuario, dinero)
-      VALUES ('${req.body.id}', '${req.body.nombre_usuario}', ${req.body.dinero})`;
-    let db_response = await db.query(query);
+      VALUES ($1, $2, $3)`;
+    let params = [req.body.id, req.body.nombre_usuario, req.body.dinero];
+    let db_response = await db.query(query, params);
     res.json(db_response.rowCount == 1 ? 
       {message: 'Registro creado correctamente'} : 
       {error: 'No se pudo crear el registro'});
@@ -149,7 +159,6 @@ app.post('/user', jsonParser, async (req, res) => {
   }
 });
 */
-
 // --- SOCKET.IO ---
 
 io.on('connection', (socket) => {
@@ -159,13 +168,20 @@ io.on('connection', (socket) => {
     let user = socket.data.username;
     if (room && user && users[room]) {
       users[room].delete(user);
+      
+      // Transferir host si el host se desconecta
+      if (socket.data.isHost && users[room].size > 0) {
+        const newHost = Array.from(users[room])[0];
+        io.to(room).emit('new_host', newHost);
+      }
+      
       if (users[room].size === 0) {
-        // limpiar sala y juego
+        // Limpieza segura de sala
+        if (gameRooms[room]?.intervalo) {
+          clearInterval(gameRooms[room].intervalo!);
+        }
         delete users[room];
-       if (gameRooms[room]?.intervalo) {
-  clearInterval(gameRooms[room].intervalo!);
-}
-
+        delete gameRooms[room];
       } else {
         io.to(room).emit('user_list_' + room, Array.from(users[room]));
       }
@@ -173,6 +189,13 @@ io.on('connection', (socket) => {
   });
 
   socket.on('join_room', ({ info }) => {
+    // Validación de código de sala
+    const roomCodeRegex = /^[A-Z0-9]{4,6}$/i;
+    if (!roomCodeRegex.test(info.code)) {
+      socket.disconnect();
+      return;
+    }
+
     let { code, user_name } = info;
     socket.join(code);
     socket.data.username = user_name;
@@ -181,6 +204,14 @@ io.on('connection', (socket) => {
     if (!users[code]) users[code] = new Set();
     users[code].add(user_name);
 
+    // Determinar si es el primer jugador (host)
+    const isFirstUser = users[code].size === 1;
+    if (isFirstUser) {
+      socket.data.isHost = true;
+      socket.emit('set_host'); // Notificar al primer usuario que es host
+    }
+
+    // Crear sala de juego si no existe
     if (!gameRooms[code]) {
       gameRooms[code] = {
         numerosCantados: [],
@@ -189,33 +220,45 @@ io.on('connection', (socket) => {
         juegoTerminado: false,
         ganador: null,
         intervalo: undefined,
+        juegoIniciado: false // Juego no iniciado inicialmente
       };
-
-      // Lanzar números automáticamente cada 6 segundos
-      gameRooms[code].intervalo = setInterval(() => {
-      let room = gameRooms[code];
-      if (!room) return;
-
-      if (room.numerosDisponibles.length === 0) {
-      if (room.intervalo) clearInterval(room.intervalo);
-      room.juegoTerminado = true;
-      io.to(code).emit('game_ended', { ganador: room.ganador || null });
-      return;
-  }
-
-      let numero = room.numerosDisponibles.shift()!;
-      room.numeroActual = numero;
-      room.numerosCantados.push(numero);
-
-    io.to(code).emit('numero_actual', {
-      numeroActual: numero,
-      numerosCantados: room.numerosCantados
-  });
-
-}, 6000);
     }
 
+    // Enviar lista de usuarios
     io.to(code).emit('user_list_' + code, Array.from(users[code]));
+  });
+
+  // Manejar inicio del juego por el host
+  socket.on('start_game', (roomCode) => {
+    const room = gameRooms[roomCode];
+    if (!room || room.juegoIniciado) return;
+
+    // Solo el host puede iniciar el juego
+    if (socket.data.isHost) {
+      room.juegoIniciado = true;
+      
+      // Iniciar intervalo para cantar números
+      room.intervalo = setInterval(() => {
+        if (room.numerosDisponibles.length === 0) {
+          if (room.intervalo) clearInterval(room.intervalo);
+          room.juegoTerminado = true;
+          io.to(roomCode).emit('game_ended', { ganador: room.ganador || null });
+          return;
+        }
+
+        let numero = room.numerosDisponibles.shift()!;
+        room.numeroActual = numero;
+        room.numerosCantados.push(numero);
+
+        io.to(roomCode).emit('numero_actual', {
+          numeroActual: numero,
+          numerosCantados: room.numerosCantados
+        });
+      }, 6000);
+
+      // Notificar a todos que el juego comenzó
+      io.to(roomCode).emit('game_started');
+    }
   });
 
   socket.on('bingo_cantado', ({ roomCode, jugador }) => {
