@@ -1,332 +1,229 @@
-import express from "express";
+import express from 'express';
+import http from 'http';
+import { Server } from 'socket.io';
 import cors from 'cors';
-const app = express();
-app.use(cors());
-
+import path from 'path';
 import bodyParser from 'body-parser';
-const jsonParser = bodyParser.json();
-
 import * as db from './db-connection';
 
-app.get('/players/:id', async (req, res) => {
-    console.log(`Petición recibida al endpoint GET /user/:email.`);
-    console.log(`Parámetro recibido por URL: ${req.params.email}`);
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST']
+  },
+  connectionStateRecovery: {
+    maxDisconnectionDuration: 2 * 60 * 1000,
+    skipMiddlewares: true
+  }
+});
 
-    try{
-        let query = `SELECT * FROM users WHERE id='${req.params.email}'`;
-        let db_response = await db.query(query);
+const port = process.env.PORT || 3000;
+const jsonParser = bodyParser.json();
 
-        if(db_response.rows.length > 0){
-            console.log(`Usuario encontrado: ${db_response.rows[0].id}`);
-            res.json(db_response.rows[0]);   
-        } else{
-            console.log(`Usuario no encontrado.`)
-            res.json(`User not found`);
+app.use(cors());
+app.use(express.static(path.join(__dirname, 'dist/chat-app')));
+
+// Estructuras para gestión de salas
+const roomHosts: Record<string, string> = {};
+const rooms: Record<string, {
+  players: Set<string>;
+  gameActive: boolean;
+  numbers: number[];
+  calledNumbers: number[];
+  currentNumber: number | null;
+  interval?: NodeJS.Timeout;
+}> = {};
+
+io.on('connection', (socket: any) => {
+  console.log('Nuevo cliente conectado:', socket.id);
+  
+  socket.on('disconnect', (reason: string) => {
+    console.log('Cliente desconectado:', socket.id, 'Razón:', reason);
+    const username = socket.data.username;
+    const roomCode = socket.data.room_code;
+    
+    if (username && roomCode && rooms[roomCode]) {
+      rooms[roomCode].players.delete(username);
+      console.log(`Usuario ${username} removido de sala ${roomCode}`);
+      
+      if (rooms[roomCode].players.size === 0) {
+        console.log(`Sala ${roomCode} vacía, eliminando...`);
+        if (rooms[roomCode].interval) {
+          clearInterval(rooms[roomCode].interval);
         }
-
-    } catch (err){
-        console.error(err);
-        res.status(500).send('Internal Server Error');
+        delete rooms[roomCode];
+        delete roomHosts[roomCode];
+      } else {
+        io.to(roomCode).emit('user_list', Array.from(rooms[roomCode].players));
+      }
     }
+  });
 
+  socket.on('join_room', (data: any) => {
+    console.log('Solicitud para unirse a sala:', data);
+    const { code, username } = data;
+    
+    if (!code || !username) {
+      console.error('Datos inválidos para unirse a sala');
+      return;
+    }
+    
+    socket.join(code);
+    socket.data.username = username;
+    socket.data.room_code = code;
+
+    if (!rooms[code]) {
+      console.log(`Creando nueva sala: ${code}`);
+      rooms[code] = {
+        players: new Set(),
+        gameActive: false,
+        numbers: [],
+        calledNumbers: [],
+        currentNumber: null
+      };
+    }
+    
+    rooms[code].players.add(username);
+    console.log(`Usuario ${username} añadido a sala ${code}`);
+    io.to(code).emit('user_list', Array.from(rooms[code].players));
+
+    if (!roomHosts[code]) {
+      roomHosts[code] = username;
+      socket.emit('set_host', true);
+      console.log(`Host establecido: ${username} en sala ${code}`);
+    }
+    
+    // Enviar estado actual si el juego ya está en progreso
+    if (rooms[code].gameActive) {
+      console.log(`Enviando estado actual a nuevo jugador en sala ${code}`);
+      socket.emit('game_started');
+      socket.emit('current_state', {
+        numbers: rooms[code].calledNumbers,
+        current: rooms[code].currentNumber
+      });
+    }
+  });
+
+  socket.on('start_game', (roomCode: string) => {
+    console.log(`Solicitud para iniciar juego en sala ${roomCode}`);
+    
+    if (!roomHosts[roomCode] || !rooms[roomCode]) {
+      console.error('Sala no existe o no tiene host');
+      return;
+    }
+    
+    if (roomHosts[roomCode] === socket.data.username) {
+      console.log(`Iniciando juego en sala ${roomCode}`);
+      rooms[roomCode].gameActive = true;
+      
+      // Generar números aleatorios (1-90)
+      rooms[roomCode].numbers = Array.from({ length: 90 }, (_, i) => i + 1);
+      // Barajar los números
+      for (let i = rooms[roomCode].numbers.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [rooms[roomCode].numbers[i], rooms[roomCode].numbers[j]] = 
+          [rooms[roomCode].numbers[j], rooms[roomCode].numbers[i]];
+      }
+      
+      rooms[roomCode].calledNumbers = [];
+      rooms[roomCode].currentNumber = null;
+      
+      // Enviar primer número inmediatamente
+      if (rooms[roomCode].numbers.length > 0) {
+        const firstNumber = rooms[roomCode].numbers.pop()!;
+        rooms[roomCode].currentNumber = firstNumber;
+        rooms[roomCode].calledNumbers.push(firstNumber);
+        console.log(`Enviando primer número ${firstNumber} a sala ${roomCode}`);
+        io.to(roomCode).emit('next_number', firstNumber);
+      }
+      
+      // Iniciar intervalo para números
+      rooms[roomCode].interval = setInterval(() => {
+        if (rooms[roomCode].numbers.length === 0) {
+          clearInterval(rooms[roomCode].interval!);
+          console.log(`Todos los números han sido cantados en sala ${roomCode}`);
+          return;
+        }
+        
+        const nextNumber = rooms[roomCode].numbers.pop()!;
+        rooms[roomCode].currentNumber = nextNumber;
+        rooms[roomCode].calledNumbers.push(nextNumber);
+        
+        console.log(`Enviando número ${nextNumber} a sala ${roomCode}`);
+        io.to(roomCode).emit('next_number', nextNumber);
+      }, 6000); // 6 segundos
+      
+      io.to(roomCode).emit('game_started');
+    } else {
+      console.log('Intento de inicio no autorizado:', socket.data.username, 'no es host');
+    }
+  });
+
+  socket.on('bingo', (data: {roomCode: string, cartonIndex: number, markedNumbers: number[]}) => {
+    console.log('Bingo recibido:', data);
+    const roomCode = data.roomCode;
+    const username = socket.data.username;
+    
+    if (!rooms[roomCode] || !rooms[roomCode].gameActive) {
+      console.log('Juego no activo o sala no existe');
+      return;
+    }
+    
+    // Verificar bingo
+    const isValid = data.markedNumbers.every(num => 
+      rooms[roomCode].calledNumbers.includes(num)
+    );
+    
+    if (isValid) {
+      // Terminar juego para todos
+      if (rooms[roomCode].interval) {
+        clearInterval(rooms[roomCode].interval);
+      }
+      rooms[roomCode].gameActive = false;
+      
+      console.log(`¡Bingo válido! ${username} ha ganado en sala ${roomCode}`);
+      io.to(roomCode).emit('game_won', {
+        winner: username,
+        cartonIndex: data.cartonIndex
+      });
+    } else {
+      console.log(`Bingo inválido de ${username} en sala ${roomCode}`);
+      socket.emit('bingo_invalid', data.cartonIndex);
+    }
+  });
+});
+
+// Endpoints REST API
+app.get('/players/:id', async (req, res) => {
+  console.log(`GET /players/${req.params.id}`);
+  try {
+    let query = `SELECT * FROM usuarios WHERE id='${req.params.id}'`;
+    let db_response = await db.query(query);
+    res.json(db_response.rows.length > 0 ? db_response.rows[0] : {error: 'User not found'});
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Internal Server Error');
+  }
 });
 
 app.post('/user', jsonParser, async (req, res) => {
-
-    console.log(`Petición recibida al endpoint POST /user. 
-        Body: ${JSON.stringify(req.body)}`);
-
-    try {
-        
-        let query = `INSERT INTO users 
-        VALUES ('${req.body.id}', '${req.body.nombre}');`; 
-        let db_response = await db.query(query);
-
-        console.log(db_response);
-
-        if(db_response.rowCount == 1){
-            res.json(`El registro ha sido creado correctamente.`);
-        } else{
-            res.json(`El registro NO ha sido creado.`);
-        }
-    
-    } catch (err) {
-        console.error(err);
-        res.status(500).send('Internal Server Error');
-    }
+  console.log('POST /user', req.body);
+  try {
+    let query = `INSERT INTO usuarios (id, nombre_usuario, dinero)
+      VALUES ('${req.body.id}', '${req.body.nombre_usuario}', ${req.body.dinero})`;
+    let db_response = await db.query(query);
+    res.json(db_response.rowCount == 1 ? 
+      {message: 'Registro creado correctamente'} : 
+      {error: 'No se pudo crear el registro'});
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Internal Server Error');
+  }
 });
 
-app.get('/products', async (req, res) => {
-    console.log(`Petición recibida al endpoint GET /products`);
-   
-
-    try{
-        let query = `SELECT * FROM products ORDER BY price ASC`;
-        let db_response = await db.query(query);
-
-        if(db_response.rows.length > 0){
-            console.log(`Numero de productos encontrado: ${db_response.rows.length}`);
-            res.json(db_response.rows);   
-        } else{
-            console.log(`Producto no encontrado.`)
-            res.json(`User not found`);
-        }
-
-    } catch (err){
-        console.error(err);
-        res.status(500).send('Internal Server Error');
-    }
-
+server.listen(port, () => {
+  console.log(`Servidor escuchando en http://localhost:${port}`);
+  console.log('Modo:', process.env.NODE_ENV || 'development');
 });
-
-app.post('/products/buy', jsonParser, async (req, res) => {
-
-    console.log(`Petición recibida al endpoint POST /products/buy. 
-        Body: ${JSON.stringify(req.body)}`);
-
-    try {
-
-
-
-    let new_product = {
-        id_user: req.body.id_user,
-        id_product: req.body.id_product,
-        is_paid: false,
-        date_bought: new Date().toISOString().split('T'[0])
-    }
-      console.log(`Producto a añadir: ${JSON.stringify(new_product)}`);
-    //  res.json('res json')
-        let query = `INSERT INTO payments (id_user,id_product,is_paid,date_bought)
-        VALUES ('${new_product.id_user}', ${new_product.id_product}, ${new_product.is_paid}, '${new_product.date_bought}');`; 
-        let db_response = await db.query(query);
-
-
-        if(db_response.rowCount == 1){
-            console.log('Producto creado')
-            res.json(`El producto ha sido creado correctamente.`);
-        } else{
-            res.json(`El producto NO ha sido creado.`);
-        }
-    
-    } catch (err) {
-        console.error(err);
-        res.status(500).send('Internal Server Error');
-    }
-});
-app.get('/payments/unpaid', async (req, res) => {
-    console.log(`Petición recibida al endpoint GET /payments/unpaid`);
-   
-
-    try{
-        let query = `SELECT * FROM payments WHERE is_paid = false ORDER BY date_bought DESC;`;
-        let db_response = await db.query(query);
-
-        if(db_response.rows.length > 0){
-            console.log(`Productos no pagados: ${db_response.rows}`);
-            res.json(db_response.rows);   
-        } else{
-            console.log(`Producto no encontrado.`)
-            res.json(`User not found`);
-        }
-
-    } catch (err){
-        console.error(err);
-        res.status(500).send('Internal Server Error');
-    }
-
-});
-app.get('/payments/paid', async (req, res) => {
-    console.log(`Petición recibida al endpoint GET /payments/paid`);
-   
- 
-    try{
-        let query = `SELECT * FROM payments WHERE is_paid = true ORDER BY date_paid DESC;`;
-        let db_response = await db.query(query);
-
-        if(db_response.rows.length > 0){
-            console.log(`Productos no pagados: ${db_response.rows}`);
-            res.json(db_response.rows);   
-        } else{
-            console.log(`Producto no encontrado.`)
-            res.json(`User not found`);
-        }
-
-    } catch (err){
-        console.error(err);
-        res.status(500).send('Internal Server Error');
-    }
-
-});
-app.post('/products/pay', jsonParser, async (req, res) => {
-
-    console.log(`Petición recibida al endpoint POST /products/buy. 
-        Body: ${JSON.stringify(req.body)}`);
-
-    try {
-
-        let update_product = {
-            id_user: req.body.id_user,
-            id_product: req.body.id_product,
-            is_paid: true,
-            date_paid: new Date().toISOString().split('T'[0])
-        }
-    
-    //  res.json('res json')
-        let query = `UPDATE payments SET 
-        is_paid =  '${update_product.is_paid}', date_paid = '${update_product.date_paid}' WHERE id = '${req.body.id}' AND id_user = '${req.body.id_user}';`;
-            
-        let db_response = await db.query(query);
-
-
-        if(db_response.rowCount == 1){
-            console.log('Producto actualizado')
-            res.json(`El producto ha sido actualizado correctamente.`);
-        } else{
-            res.json(`El producto NO ha sido actualizado.`);
-        }
-    
-    } catch (err) {
-        console.error(err);
-        res.status(500).send('Internal Server Error');
-    }
-});
-
-app.post('/alumno', jsonParser, async (req, res) => {
-
-    console.log(`Petición recibida al endpoint POST /alumno. 
-        Body: ${JSON.stringify(req.body)}`);
-
-    try {
-
-
-
-    let new_student = {
-        id: req.body.id,
-        name: req.body.name,
-        surname: req.body.surname,
-        age: req.body.age,
-        grade: req.body.grade
-    }
-      console.log(`Alumno a añadir: ${JSON.stringify(new_student)}`);
-    //  res.json('res json')
-
-
-
-
-
-        let query = `INSERT INTO alumnos VALUES ('${new_student.id}', '${new_student.name}', '${new_student.surname}', ${new_student.age},'${new_student.grade}');`; 
-        let db_response = await db.query(query);
-
-
-        if(db_response.rowCount == 1){
-            console.log('Alumno creado')
-            res.json(`El Alumno ha sido creado correctamente.`);
-        } else{
-            res.json(`El Alumno No ha sido creado.`);
-        }
-    
-    } catch (err) {
-        console.error(err);
-        res.status(500).send('Internal Server Error');
-    }
-});
-
-app.get('/alumnos', async (req, res) => {
-    console.log(`Petición recibida al endpoint GET /alumnos`);
-   
- 
-    try{
-        let query = `SELECT * FROM alumnos;`;
-        let db_response = await db.query(query);
-
-        if(db_response.rows.length > 0){
-            console.log(`Alumnos: ${db_response.rows}`);
-            res.json(db_response.rows);   
-        } else{
-            console.log(`Alumno no encontrado.`)
-            res.json(`User not found`);
-        }
-
-    } catch (err){
-        console.error(err);
-        res.status(500).send('Internal Server Error');
-    }
-
-});
-app.get('/alumno/delete/:id', async (req, res) => {
-    console.log(`Petición recibida al endpoint GET /alumno/delete`);
-    console.log(`Parámetro recibido por URL: ${req.params.id}`);
-
-    try{
-        let query = `DELETE FROM alumnos WHERE id='${req.params.id}'`;
-        let db_response = await db.query(query);
-
-        if(db_response.rowCount > 0){
-            console.log(`Alumno ${req.params.id} eliminado: `);
-            res.json("Alumno delete");   
-        } else{
-            console.log(`Alumno no eliminado.`)
-            res.json(`User not found`);
-        }
-
-    } catch (err){
-        console.error(err);
-        res.status(500).send('Internal Server Error');
-    }
-
-});
-
-
-
-/*app.post('/perfil', jsonParser, async (req, res) => {
-    console.log(`Petición recibida al endpoint POST /perfil. 
-        Body:${JSON.stringify(req.body)}`);
-    try {
-        
-        let query = `INSERT INTO alumnos (name, email, img) 
-        VALUES ('${req.body.name}', '${req.body.email}', '${req.body.img}');`;
-        console.log(query);
-        let db_response = await db.query(query);
-        console.log(db_response);
-        
-        res.json(`El registro del señor/a ${req.body.nombre} ${req.body.apellidos}, con domicilio ${req.body.direccion},
-             y color de pelo ${req.body.color_pelo} ha sido creado.`);
-
-    } catch (err) {
-        console.error(err);
-        res.status(500).send('Internal Server Error');
-    }
-});
-
-app.get('/suma/:valor1/:valor2', (req, res) => {
-    let resultado: number = 0;
-    resultado = Number(req.params.valor1) + Number(req.params.valor2);
-    console.log("resultado: " + resultado);
-    res.send(String(resultado));
-});*/
-
-/*app.post('/futbolistas', jsonParser, async (req, res) => {
-    console.log(`Petición recibida al endpoint POST /futbolistas. 
-        Body:${JSON.stringify(req.body)}`);
-    try {
-        let query = `INSERT INTO alumnos (name, email, img) 
-        VALUES ('${req.body.name}', '${req.body.email}', '${req.body.img}');`;
-        console.log(query);
-        let db_response = await db.query(query);
-        console.log(db_response);
-        res.json("Registro guardado correctamente.");
-    } catch (err) {
-        console.error(err);
-        res.status(500).send('Internal Server Error');
-    }
-});*/
-
-const port = process.env.PORT || 3000;
-
-app.listen(port, () => 
-    console.log(`App listening on PORT ${port}.
-
-    ENDPOINTS:
-    
-     
-     `));

@@ -59,34 +59,182 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 var express_1 = __importDefault(require("express"));
+var http_1 = __importDefault(require("http"));
+var socket_io_1 = require("socket.io");
 var cors_1 = __importDefault(require("cors"));
-var app = express_1.default();
-app.use(cors_1.default());
+var path_1 = __importDefault(require("path"));
 var body_parser_1 = __importDefault(require("body-parser"));
-var jsonParser = body_parser_1.default.json();
 var db = __importStar(require("./db-connection"));
+var app = express_1.default();
+var server = http_1.default.createServer(app);
+var io = new socket_io_1.Server(server, {
+    cors: {
+        origin: '*',
+        methods: ['GET', 'POST']
+    },
+    connectionStateRecovery: {
+        maxDisconnectionDuration: 2 * 60 * 1000,
+        skipMiddlewares: true
+    }
+});
+var port = process.env.PORT || 3000;
+var jsonParser = body_parser_1.default.json();
+app.use(cors_1.default());
+app.use(express_1.default.static(path_1.default.join(__dirname, 'dist/chat-app')));
+// Estructuras para gestión de salas
+var roomHosts = {};
+var rooms = {};
+io.on('connection', function (socket) {
+    console.log('Nuevo cliente conectado:', socket.id);
+    socket.on('disconnect', function (reason) {
+        console.log('Cliente desconectado:', socket.id, 'Razón:', reason);
+        var username = socket.data.username;
+        var roomCode = socket.data.room_code;
+        if (username && roomCode && rooms[roomCode]) {
+            rooms[roomCode].players.delete(username);
+            console.log("Usuario " + username + " removido de sala " + roomCode);
+            if (rooms[roomCode].players.size === 0) {
+                console.log("Sala " + roomCode + " vac\u00EDa, eliminando...");
+                if (rooms[roomCode].interval) {
+                    clearInterval(rooms[roomCode].interval);
+                }
+                delete rooms[roomCode];
+                delete roomHosts[roomCode];
+            }
+            else {
+                io.to(roomCode).emit('user_list', Array.from(rooms[roomCode].players));
+            }
+        }
+    });
+    socket.on('join_room', function (data) {
+        console.log('Solicitud para unirse a sala:', data);
+        var code = data.code, username = data.username;
+        if (!code || !username) {
+            console.error('Datos inválidos para unirse a sala');
+            return;
+        }
+        socket.join(code);
+        socket.data.username = username;
+        socket.data.room_code = code;
+        if (!rooms[code]) {
+            console.log("Creando nueva sala: " + code);
+            rooms[code] = {
+                players: new Set(),
+                gameActive: false,
+                numbers: [],
+                calledNumbers: [],
+                currentNumber: null
+            };
+        }
+        rooms[code].players.add(username);
+        console.log("Usuario " + username + " a\u00F1adido a sala " + code);
+        io.to(code).emit('user_list', Array.from(rooms[code].players));
+        if (!roomHosts[code]) {
+            roomHosts[code] = username;
+            socket.emit('set_host', true);
+            console.log("Host establecido: " + username + " en sala " + code);
+        }
+        // Enviar estado actual si el juego ya está en progreso
+        if (rooms[code].gameActive) {
+            console.log("Enviando estado actual a nuevo jugador en sala " + code);
+            socket.emit('game_started');
+            socket.emit('current_state', {
+                numbers: rooms[code].calledNumbers,
+                current: rooms[code].currentNumber
+            });
+        }
+    });
+    socket.on('start_game', function (roomCode) {
+        var _a;
+        console.log("Solicitud para iniciar juego en sala " + roomCode);
+        if (!roomHosts[roomCode] || !rooms[roomCode]) {
+            console.error('Sala no existe o no tiene host');
+            return;
+        }
+        if (roomHosts[roomCode] === socket.data.username) {
+            console.log("Iniciando juego en sala " + roomCode);
+            rooms[roomCode].gameActive = true;
+            // Generar números aleatorios (1-90)
+            rooms[roomCode].numbers = Array.from({ length: 90 }, function (_, i) { return i + 1; });
+            // Barajar los números
+            for (var i = rooms[roomCode].numbers.length - 1; i > 0; i--) {
+                var j = Math.floor(Math.random() * (i + 1));
+                _a = [rooms[roomCode].numbers[j], rooms[roomCode].numbers[i]], rooms[roomCode].numbers[i] = _a[0], rooms[roomCode].numbers[j] = _a[1];
+            }
+            rooms[roomCode].calledNumbers = [];
+            rooms[roomCode].currentNumber = null;
+            // Enviar primer número inmediatamente
+            if (rooms[roomCode].numbers.length > 0) {
+                var firstNumber = rooms[roomCode].numbers.pop();
+                rooms[roomCode].currentNumber = firstNumber;
+                rooms[roomCode].calledNumbers.push(firstNumber);
+                console.log("Enviando primer n\u00FAmero " + firstNumber + " a sala " + roomCode);
+                io.to(roomCode).emit('next_number', firstNumber);
+            }
+            // Iniciar intervalo para números
+            rooms[roomCode].interval = setInterval(function () {
+                if (rooms[roomCode].numbers.length === 0) {
+                    clearInterval(rooms[roomCode].interval);
+                    console.log("Todos los n\u00FAmeros han sido cantados en sala " + roomCode);
+                    return;
+                }
+                var nextNumber = rooms[roomCode].numbers.pop();
+                rooms[roomCode].currentNumber = nextNumber;
+                rooms[roomCode].calledNumbers.push(nextNumber);
+                console.log("Enviando n\u00FAmero " + nextNumber + " a sala " + roomCode);
+                io.to(roomCode).emit('next_number', nextNumber);
+            }, 6000); // 6 segundos
+            io.to(roomCode).emit('game_started');
+        }
+        else {
+            console.log('Intento de inicio no autorizado:', socket.data.username, 'no es host');
+        }
+    });
+    socket.on('bingo', function (data) {
+        console.log('Bingo recibido:', data);
+        var roomCode = data.roomCode;
+        var username = socket.data.username;
+        if (!rooms[roomCode] || !rooms[roomCode].gameActive) {
+            console.log('Juego no activo o sala no existe');
+            return;
+        }
+        // Verificar bingo
+        var isValid = data.markedNumbers.every(function (num) {
+            return rooms[roomCode].calledNumbers.includes(num);
+        });
+        if (isValid) {
+            // Terminar juego para todos
+            if (rooms[roomCode].interval) {
+                clearInterval(rooms[roomCode].interval);
+            }
+            rooms[roomCode].gameActive = false;
+            console.log("\u00A1Bingo v\u00E1lido! " + username + " ha ganado en sala " + roomCode);
+            io.to(roomCode).emit('game_won', {
+                winner: username,
+                cartonIndex: data.cartonIndex
+            });
+        }
+        else {
+            console.log("Bingo inv\u00E1lido de " + username + " en sala " + roomCode);
+            socket.emit('bingo_invalid', data.cartonIndex);
+        }
+    });
+});
+// Endpoints REST API
 app.get('/players/:id', function (req, res) { return __awaiter(void 0, void 0, void 0, function () {
     var query, db_response, err_1;
     return __generator(this, function (_a) {
         switch (_a.label) {
             case 0:
-                console.log("Petici\u00F3n recibida al endpoint GET /user/:email.");
-                console.log("Par\u00E1metro recibido por URL: " + req.params.email);
+                console.log("GET /players/" + req.params.id);
                 _a.label = 1;
             case 1:
                 _a.trys.push([1, 3, , 4]);
-                query = "SELECT * FROM users WHERE id='" + req.params.email + "'";
+                query = "SELECT * FROM usuarios WHERE id='" + req.params.id + "'";
                 return [4 /*yield*/, db.query(query)];
             case 2:
                 db_response = _a.sent();
-                if (db_response.rows.length > 0) {
-                    console.log("Usuario encontrado: " + db_response.rows[0].id);
-                    res.json(db_response.rows[0]);
-                }
-                else {
-                    console.log("Usuario no encontrado.");
-                    res.json("User not found");
-                }
+                res.json(db_response.rows.length > 0 ? db_response.rows[0] : { error: 'User not found' });
                 return [3 /*break*/, 4];
             case 3:
                 err_1 = _a.sent();
@@ -102,21 +250,17 @@ app.post('/user', jsonParser, function (req, res) { return __awaiter(void 0, voi
     return __generator(this, function (_a) {
         switch (_a.label) {
             case 0:
-                console.log("Petici\u00F3n recibida al endpoint POST /user. \n        Body: " + JSON.stringify(req.body));
+                console.log('POST /user', req.body);
                 _a.label = 1;
             case 1:
                 _a.trys.push([1, 3, , 4]);
-                query = "INSERT INTO users \n        VALUES ('" + req.body.id + "', '" + req.body.nombre + "');";
+                query = "INSERT INTO usuarios (id, nombre_usuario, dinero)\n      VALUES ('" + req.body.id + "', '" + req.body.nombre_usuario + "', " + req.body.dinero + ")";
                 return [4 /*yield*/, db.query(query)];
             case 2:
                 db_response = _a.sent();
-                console.log(db_response);
-                if (db_response.rowCount == 1) {
-                    res.json("El registro ha sido creado correctamente.");
-                }
-                else {
-                    res.json("El registro NO ha sido creado.");
-                }
+                res.json(db_response.rowCount == 1 ?
+                    { message: 'Registro creado correctamente' } :
+                    { error: 'No se pudo crear el registro' });
                 return [3 /*break*/, 4];
             case 3:
                 err_2 = _a.sent();
@@ -127,315 +271,7 @@ app.post('/user', jsonParser, function (req, res) { return __awaiter(void 0, voi
         }
     });
 }); });
-app.get('/products', function (req, res) { return __awaiter(void 0, void 0, void 0, function () {
-    var query, db_response, err_3;
-    return __generator(this, function (_a) {
-        switch (_a.label) {
-            case 0:
-                console.log("Petici\u00F3n recibida al endpoint GET /products");
-                _a.label = 1;
-            case 1:
-                _a.trys.push([1, 3, , 4]);
-                query = "SELECT * FROM products ORDER BY price ASC";
-                return [4 /*yield*/, db.query(query)];
-            case 2:
-                db_response = _a.sent();
-                if (db_response.rows.length > 0) {
-                    console.log("Numero de productos encontrado: " + db_response.rows.length);
-                    res.json(db_response.rows);
-                }
-                else {
-                    console.log("Producto no encontrado.");
-                    res.json("User not found");
-                }
-                return [3 /*break*/, 4];
-            case 3:
-                err_3 = _a.sent();
-                console.error(err_3);
-                res.status(500).send('Internal Server Error');
-                return [3 /*break*/, 4];
-            case 4: return [2 /*return*/];
-        }
-    });
-}); });
-app.post('/products/buy', jsonParser, function (req, res) { return __awaiter(void 0, void 0, void 0, function () {
-    var new_product, query, db_response, err_4;
-    return __generator(this, function (_a) {
-        switch (_a.label) {
-            case 0:
-                console.log("Petici\u00F3n recibida al endpoint POST /products/buy. \n        Body: " + JSON.stringify(req.body));
-                _a.label = 1;
-            case 1:
-                _a.trys.push([1, 3, , 4]);
-                new_product = {
-                    id_user: req.body.id_user,
-                    id_product: req.body.id_product,
-                    is_paid: false,
-                    date_bought: new Date().toISOString().split('T'[0])
-                };
-                console.log("Producto a a\u00F1adir: " + JSON.stringify(new_product));
-                query = "INSERT INTO payments (id_user,id_product,is_paid,date_bought)\n        VALUES ('" + new_product.id_user + "', " + new_product.id_product + ", " + new_product.is_paid + ", '" + new_product.date_bought + "');";
-                return [4 /*yield*/, db.query(query)];
-            case 2:
-                db_response = _a.sent();
-                if (db_response.rowCount == 1) {
-                    console.log('Producto creado');
-                    res.json("El producto ha sido creado correctamente.");
-                }
-                else {
-                    res.json("El producto NO ha sido creado.");
-                }
-                return [3 /*break*/, 4];
-            case 3:
-                err_4 = _a.sent();
-                console.error(err_4);
-                res.status(500).send('Internal Server Error');
-                return [3 /*break*/, 4];
-            case 4: return [2 /*return*/];
-        }
-    });
-}); });
-app.get('/payments/unpaid', function (req, res) { return __awaiter(void 0, void 0, void 0, function () {
-    var query, db_response, err_5;
-    return __generator(this, function (_a) {
-        switch (_a.label) {
-            case 0:
-                console.log("Petici\u00F3n recibida al endpoint GET /payments/unpaid");
-                _a.label = 1;
-            case 1:
-                _a.trys.push([1, 3, , 4]);
-                query = "SELECT * FROM payments WHERE is_paid = false ORDER BY date_bought DESC;";
-                return [4 /*yield*/, db.query(query)];
-            case 2:
-                db_response = _a.sent();
-                if (db_response.rows.length > 0) {
-                    console.log("Productos no pagados: " + db_response.rows);
-                    res.json(db_response.rows);
-                }
-                else {
-                    console.log("Producto no encontrado.");
-                    res.json("User not found");
-                }
-                return [3 /*break*/, 4];
-            case 3:
-                err_5 = _a.sent();
-                console.error(err_5);
-                res.status(500).send('Internal Server Error');
-                return [3 /*break*/, 4];
-            case 4: return [2 /*return*/];
-        }
-    });
-}); });
-app.get('/payments/paid', function (req, res) { return __awaiter(void 0, void 0, void 0, function () {
-    var query, db_response, err_6;
-    return __generator(this, function (_a) {
-        switch (_a.label) {
-            case 0:
-                console.log("Petici\u00F3n recibida al endpoint GET /payments/paid");
-                _a.label = 1;
-            case 1:
-                _a.trys.push([1, 3, , 4]);
-                query = "SELECT * FROM payments WHERE is_paid = true ORDER BY date_paid DESC;";
-                return [4 /*yield*/, db.query(query)];
-            case 2:
-                db_response = _a.sent();
-                if (db_response.rows.length > 0) {
-                    console.log("Productos no pagados: " + db_response.rows);
-                    res.json(db_response.rows);
-                }
-                else {
-                    console.log("Producto no encontrado.");
-                    res.json("User not found");
-                }
-                return [3 /*break*/, 4];
-            case 3:
-                err_6 = _a.sent();
-                console.error(err_6);
-                res.status(500).send('Internal Server Error');
-                return [3 /*break*/, 4];
-            case 4: return [2 /*return*/];
-        }
-    });
-}); });
-app.post('/products/pay', jsonParser, function (req, res) { return __awaiter(void 0, void 0, void 0, function () {
-    var update_product, query, db_response, err_7;
-    return __generator(this, function (_a) {
-        switch (_a.label) {
-            case 0:
-                console.log("Petici\u00F3n recibida al endpoint POST /products/buy. \n        Body: " + JSON.stringify(req.body));
-                _a.label = 1;
-            case 1:
-                _a.trys.push([1, 3, , 4]);
-                update_product = {
-                    id_user: req.body.id_user,
-                    id_product: req.body.id_product,
-                    is_paid: true,
-                    date_paid: new Date().toISOString().split('T'[0])
-                };
-                query = "UPDATE payments SET \n        is_paid =  '" + update_product.is_paid + "', date_paid = '" + update_product.date_paid + "' WHERE id = '" + req.body.id + "' AND id_user = '" + req.body.id_user + "';";
-                return [4 /*yield*/, db.query(query)];
-            case 2:
-                db_response = _a.sent();
-                if (db_response.rowCount == 1) {
-                    console.log('Producto actualizado');
-                    res.json("El producto ha sido actualizado correctamente.");
-                }
-                else {
-                    res.json("El producto NO ha sido actualizado.");
-                }
-                return [3 /*break*/, 4];
-            case 3:
-                err_7 = _a.sent();
-                console.error(err_7);
-                res.status(500).send('Internal Server Error');
-                return [3 /*break*/, 4];
-            case 4: return [2 /*return*/];
-        }
-    });
-}); });
-app.post('/alumno', jsonParser, function (req, res) { return __awaiter(void 0, void 0, void 0, function () {
-    var new_student, query, db_response, err_8;
-    return __generator(this, function (_a) {
-        switch (_a.label) {
-            case 0:
-                console.log("Petici\u00F3n recibida al endpoint POST /alumno. \n        Body: " + JSON.stringify(req.body));
-                _a.label = 1;
-            case 1:
-                _a.trys.push([1, 3, , 4]);
-                new_student = {
-                    id: req.body.id,
-                    name: req.body.name,
-                    surname: req.body.surname,
-                    age: req.body.age,
-                    grade: req.body.grade
-                };
-                console.log("Alumno a a\u00F1adir: " + JSON.stringify(new_student));
-                query = "INSERT INTO alumnos VALUES ('" + new_student.id + "', '" + new_student.name + "', '" + new_student.surname + "', " + new_student.age + ",'" + new_student.grade + "');";
-                return [4 /*yield*/, db.query(query)];
-            case 2:
-                db_response = _a.sent();
-                if (db_response.rowCount == 1) {
-                    console.log('Alumno creado');
-                    res.json("El Alumno ha sido creado correctamente.");
-                }
-                else {
-                    res.json("El Alumno No ha sido creado.");
-                }
-                return [3 /*break*/, 4];
-            case 3:
-                err_8 = _a.sent();
-                console.error(err_8);
-                res.status(500).send('Internal Server Error');
-                return [3 /*break*/, 4];
-            case 4: return [2 /*return*/];
-        }
-    });
-}); });
-app.get('/alumnos', function (req, res) { return __awaiter(void 0, void 0, void 0, function () {
-    var query, db_response, err_9;
-    return __generator(this, function (_a) {
-        switch (_a.label) {
-            case 0:
-                console.log("Petici\u00F3n recibida al endpoint GET /alumnos");
-                _a.label = 1;
-            case 1:
-                _a.trys.push([1, 3, , 4]);
-                query = "SELECT * FROM alumnos;";
-                return [4 /*yield*/, db.query(query)];
-            case 2:
-                db_response = _a.sent();
-                if (db_response.rows.length > 0) {
-                    console.log("Alumnos: " + db_response.rows);
-                    res.json(db_response.rows);
-                }
-                else {
-                    console.log("Alumno no encontrado.");
-                    res.json("User not found");
-                }
-                return [3 /*break*/, 4];
-            case 3:
-                err_9 = _a.sent();
-                console.error(err_9);
-                res.status(500).send('Internal Server Error');
-                return [3 /*break*/, 4];
-            case 4: return [2 /*return*/];
-        }
-    });
-}); });
-app.get('/alumno/delete/:id', function (req, res) { return __awaiter(void 0, void 0, void 0, function () {
-    var query, db_response, err_10;
-    return __generator(this, function (_a) {
-        switch (_a.label) {
-            case 0:
-                console.log("Petici\u00F3n recibida al endpoint GET /alumno/delete");
-                console.log("Par\u00E1metro recibido por URL: " + req.params.id);
-                _a.label = 1;
-            case 1:
-                _a.trys.push([1, 3, , 4]);
-                query = "DELETE FROM alumnos WHERE id='" + req.params.id + "'";
-                return [4 /*yield*/, db.query(query)];
-            case 2:
-                db_response = _a.sent();
-                if (db_response.rowCount > 0) {
-                    console.log("Alumno " + req.params.id + " eliminado: ");
-                    res.json("Alumno delete");
-                }
-                else {
-                    console.log("Alumno no eliminado.");
-                    res.json("User not found");
-                }
-                return [3 /*break*/, 4];
-            case 3:
-                err_10 = _a.sent();
-                console.error(err_10);
-                res.status(500).send('Internal Server Error');
-                return [3 /*break*/, 4];
-            case 4: return [2 /*return*/];
-        }
-    });
-}); });
-/*app.post('/perfil', jsonParser, async (req, res) => {
-    console.log(`Petición recibida al endpoint POST /perfil.
-        Body:${JSON.stringify(req.body)}`);
-    try {
-        
-        let query = `INSERT INTO alumnos (name, email, img)
-        VALUES ('${req.body.name}', '${req.body.email}', '${req.body.img}');`;
-        console.log(query);
-        let db_response = await db.query(query);
-        console.log(db_response);
-        
-        res.json(`El registro del señor/a ${req.body.nombre} ${req.body.apellidos}, con domicilio ${req.body.direccion},
-             y color de pelo ${req.body.color_pelo} ha sido creado.`);
-
-    } catch (err) {
-        console.error(err);
-        res.status(500).send('Internal Server Error');
-    }
-});
-
-app.get('/suma/:valor1/:valor2', (req, res) => {
-    let resultado: number = 0;
-    resultado = Number(req.params.valor1) + Number(req.params.valor2);
-    console.log("resultado: " + resultado);
-    res.send(String(resultado));
-});*/
-/*app.post('/futbolistas', jsonParser, async (req, res) => {
-    console.log(`Petición recibida al endpoint POST /futbolistas.
-        Body:${JSON.stringify(req.body)}`);
-    try {
-        let query = `INSERT INTO alumnos (name, email, img)
-        VALUES ('${req.body.name}', '${req.body.email}', '${req.body.img}');`;
-        console.log(query);
-        let db_response = await db.query(query);
-        console.log(db_response);
-        res.json("Registro guardado correctamente.");
-    } catch (err) {
-        console.error(err);
-        res.status(500).send('Internal Server Error');
-    }
-});*/
-var port = process.env.PORT || 3000;
-app.listen(port, function () {
-    return console.log("App listening on PORT " + port + ".\n\n    ENDPOINTS:\n    \n     \n     ");
+server.listen(port, function () {
+    console.log("Servidor escuchando en http://localhost:" + port);
+    console.log('Modo:', process.env.NODE_ENV || 'development');
 });
