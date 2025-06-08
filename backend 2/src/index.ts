@@ -162,8 +162,10 @@ io.on('connection', (socket) => {
       if (users[room].size === 0) {
         // limpiar sala y juego
         delete users[room];
-        if (gameRooms[room]?.intervalo) clearInterval(gameRooms[room].intervalo);
-        delete gameRooms[room];
+       if (gameRooms[room]?.intervalo) {
+  clearInterval(gameRooms[room].intervalo!);
+}
+
       } else {
         io.to(room).emit('user_list_' + room, Array.from(users[room]));
       }
