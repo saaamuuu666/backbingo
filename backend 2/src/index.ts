@@ -12,7 +12,7 @@ const app = express();
 
 // Configuración segura de CORS
 app.use(cors({
-  origin: '*', // Reemplazar con tu dominio en producción
+  origin: 'https://bingo-bad44.web.app', // Reemplazar con tu dominio en producción
   methods: ['GET', 'POST'],
   credentials: true
 }));
@@ -23,7 +23,7 @@ const jsonParser = bodyParser.json();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: 'https://bingo-bad44.web.app',
+    origin: '*',
     methods: ['GET', 'POST']
   }
 });
