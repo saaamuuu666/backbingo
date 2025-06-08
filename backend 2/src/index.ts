@@ -31,13 +31,13 @@ const io = new Server(server, {
 // --- INTERFACES ---
 
 interface GameRoomState {
-  numerosCantados: number[];
-  numerosDisponibles: number[];
-  numeroActual: number | null;
+  numerosCantados: number[];       // números ya cantados
+  numerosDisponibles: number[];    // números por cantar, orden aleatorio
+  numeroActual: number | null;     // número actual cantado
   juegoTerminado: boolean;
   ganador: string | null;
   intervalo?: NodeJS.Timeout;
-  juegoIniciado: boolean;
+  juegoIniciado: boolean;          // Nuevo campo para saber si el juego ha sido iniciado
 }
 
 // --- DATOS GLOBALES ---
@@ -76,7 +76,7 @@ export function generarCarton(): ({ numero: number, tachado: boolean } | null)[]
   for (let i = 0; i < columnas; i++) {
     let min = i === 0 ? 1 : i * 10;
     let max = i === 8 ? 90 : i * 10 + 9;
-    let cantidad = 1 + Math.floor(Math.random() * 2);
+    let cantidad = 1 + Math.floor(Math.random() * 2); // 1 o 2 números
     columnasConNumeros[i] = generarNumerosAleatorios(cantidad, min, max).sort((a, b) => a - b);
   }
 
@@ -97,6 +97,7 @@ export function generarCarton(): ({ numero: number, tachado: boolean } | null)[]
     }
   }
 
+  // Asegurar 5 números por fila
   for (let f = 0; f < filas; f++) {
     let fila = carton[f];
     while (fila.filter(c => c !== null).length < 5) {
@@ -120,6 +121,44 @@ export function generarCarton(): ({ numero: number, tachado: boolean } | null)[]
   return carton;
 }
 
+// --- RUTAS HTTP ---
+
+/*app.get('/players/:id', async (req, res) => {
+  console.log(`GET /players/${req.params.id}`);
+  try {
+    // Prevención de SQL Injection
+    let query = `SELECT * FROM usuarios WHERE id = $1`;
+    let db_response = await db.query(query, [req.params.id]);
+    res.json(db_response.rows.length > 0 ? db_response.rows[0] : {error: 'User not found'});
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Internal Server Error');
+  }
+});
+
+app.post('/user', jsonParser, async (req, res) => {
+  console.log('POST /user', req.body);
+  
+  // Validación de datos de entrada
+  if (!req.body.id || !req.body.nombre_usuario || req.body.dinero === undefined) {
+    return res.status(400).json({ error: 'Datos incompletos' });
+  }
+
+  try {
+    // Prevención de SQL Injection
+    let query = `INSERT INTO usuarios (id, nombre_usuario, dinero)
+      VALUES ($1, $2, $3)`;
+    let params = [req.body.id, req.body.nombre_usuario, req.body.dinero];
+    let db_response = await db.query(query, params);
+    res.json(db_response.rowCount == 1 ? 
+      {message: 'Registro creado correctamente'} : 
+      {error: 'No se pudo crear el registro'});
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Internal Server Error');
+  }
+});
+*/
 // --- SOCKET.IO ---
 
 io.on('connection', (socket) => {
@@ -129,13 +168,15 @@ io.on('connection', (socket) => {
     let user = socket.data.username;
     if (room && user && users[room]) {
       users[room].delete(user);
-
+      
+      // Transferir host si el host se desconecta
       if (socket.data.isHost && users[room].size > 0) {
         const newHost = Array.from(users[room])[0];
         io.to(room).emit('new_host', newHost);
       }
-
+      
       if (users[room].size === 0) {
+        // Limpieza segura de sala
         if (gameRooms[room]?.intervalo) {
           clearInterval(gameRooms[room].intervalo!);
         }
@@ -148,6 +189,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('join_room', ({ info }) => {
+    // Validación de código de sala
     const roomCodeRegex = /^[A-Z0-9]{4,6}$/i;
     if (!roomCodeRegex.test(info.code)) {
       socket.disconnect();
@@ -162,12 +204,14 @@ io.on('connection', (socket) => {
     if (!users[code]) users[code] = new Set();
     users[code].add(user_name);
 
+    // Determinar si es el primer jugador (host)
     const isFirstUser = users[code].size === 1;
     if (isFirstUser) {
       socket.data.isHost = true;
-      socket.emit('set_host');
+      socket.emit('set_host'); // Notificar al primer usuario que es host
     }
 
+    // Crear sala de juego si no existe
     if (!gameRooms[code]) {
       gameRooms[code] = {
         numerosCantados: [],
@@ -176,20 +220,24 @@ io.on('connection', (socket) => {
         juegoTerminado: false,
         ganador: null,
         intervalo: undefined,
-        juegoIniciado: false
+        juegoIniciado: false // Juego no iniciado inicialmente
       };
     }
 
+    // Enviar lista de usuarios
     io.to(code).emit('user_list_' + code, Array.from(users[code]));
   });
 
+  // Manejar inicio del juego por el host
   socket.on('start_game', (roomCode) => {
     const room = gameRooms[roomCode];
     if (!room || room.juegoIniciado) return;
 
+    // Solo el host puede iniciar el juego
     if (socket.data.isHost) {
       room.juegoIniciado = true;
-
+      
+      // Iniciar intervalo para cantar números
       room.intervalo = setInterval(() => {
         if (room.numerosDisponibles.length === 0) {
           if (room.intervalo) clearInterval(room.intervalo);
@@ -208,6 +256,7 @@ io.on('connection', (socket) => {
         });
       }, 6000);
 
+      // Notificar a todos que el juego comenzó
       io.to(roomCode).emit('game_started');
     }
   });
